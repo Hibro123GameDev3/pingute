@@ -398,6 +398,133 @@ async function handleAuth(req, res, url) {
 	return true;
 }
 
+function commentObjectKey(videoId) {
+	const reverseTimestamp = String(9999999999999 - Date.now()).padStart(13, "0");
+	return `comments/${videoId}/${reverseTimestamp}-${randomUUID()}.json`;
+}
+
+function publicComment(record) {
+	if (!record || typeof record.id !== "string" || typeof record.userId !== "string"
+		|| typeof record.username !== "string" || typeof record.text !== "string"
+		|| typeof record.createdAt !== "string" || !Number.isFinite(Date.parse(record.createdAt))) {
+		throw new Error("Stored comment record is invalid.");
+	}
+	return {
+		id: record.id,
+		userId: record.userId,
+		username: record.username,
+		text: record.text,
+		createdAt: record.createdAt
+	};
+}
+
+async function videoExists(videoId, req, res) {
+	for (const extension of Object.values(VIDEO_TYPES)) {
+		try {
+			await sendR2(new HeadObjectCommand({
+				Bucket: r2Bucket,
+				Key: videoKey(videoId, extension)
+			}), { req, res });
+			return true;
+		} catch (error) {
+			if (!isNotFound(error)) throw error;
+		}
+	}
+	return false;
+}
+
+async function listComments(videoId, req, res, cursor) {
+	const prefix = `comments/${videoId}/`;
+	const result = await sendR2(new ListObjectsV2Command({
+		Bucket: r2Bucket,
+		Prefix: prefix,
+		MaxKeys: 20,
+		...(cursor ? { ContinuationToken: cursor } : {})
+	}), { req, res });
+	const objects = (result.Contents || [])
+		.filter(object => typeof object.Key === "string" && object.Key.startsWith(prefix));
+	const comments = [];
+	for (let offset = 0; offset < objects.length; offset += 5) {
+		const batch = await Promise.all(objects.slice(offset, offset + 5).map(object =>
+			readR2Json(object.Key, { req, res })
+		));
+		comments.push(...batch.filter(Boolean).map(publicComment));
+	}
+	return {
+		comments: comments.reverse(),
+		nextCursor: result.IsTruncated ? result.NextContinuationToken : null
+	};
+}
+
+async function handleComments(req, res, videoId, url) {
+	if (!r2) {
+		sendAuthJson(res, 503, { error: "Cloudflare R2 comment storage is not configured on the server." });
+		return true;
+	}
+
+	if (req.method === "GET") {
+		if (!allowAuthAttempt(req, res, "comment-read", 60, 60 * 1000)) return true;
+		const cursor = url.searchParams.get("cursor");
+		if (cursor && cursor.length > 2048) {
+			sendAuthJson(res, 400, { error: "Invalid comments cursor." });
+			return true;
+		}
+		sendAuthJson(res, 200, await listComments(videoId, req, res, cursor));
+		return true;
+	}
+
+	if (req.method !== "POST") {
+		res.setHeader("Allow", "GET, POST");
+		sendAuthJson(res, 405, { error: "Method not allowed." });
+		return true;
+	}
+
+	if (!isTrustedRequestOrigin(req)) {
+		sendAuthJson(res, 403, { error: "This website is not allowed to post comments." });
+		return true;
+	}
+
+	const user = await currentAuthUser(req, res);
+	if (!user) {
+		sendAuthJson(res, 401, { error: "Sign in to post a comment." });
+		return true;
+	}
+
+	if (!allowAuthAttempt(req, res, "comment", 20, 60 * 1000)) return true;
+
+	let body;
+	try {
+		body = await readAuthJson(req);
+	} catch (error) {
+		const status = error.code === "AUTH_BODY_TOO_LARGE" ? 413
+			: error.code === "AUTH_UNSUPPORTED_MEDIA" ? 415 : 400;
+		sendAuthJson(res, status, { error: error.message });
+		return true;
+	}
+
+	const text = typeof body.text === "string" ? body.text.trim() : "";
+	if (!text || text.length > 500) {
+		sendAuthJson(res, 400, { error: "Comments must be between 1 and 500 characters." });
+		return true;
+	}
+	if (!await videoExists(videoId, req, res)) {
+		sendAuthJson(res, 404, { error: "Video not found." });
+		return true;
+	}
+
+	const author = authUser(user);
+	const comment = {
+		id: randomUUID(),
+		userId: author.id,
+		username: author.username,
+		text,
+		createdAt: new Date().toISOString()
+	};
+	await writeR2Json(commentObjectKey(videoId), comment, { onlyIfAbsent: true, req, res });
+	sendAuthJson(res, 201, { comment });
+	return true;
+}
+
 async function sendR2(command, { timeoutMs = 30000, req, res } = {}) {
 	const controller = new AbortController();
 	let timedOut = false;
@@ -656,11 +783,14 @@ async function readVideo(req, res, id) {
 }
 
 async function handleApi(req, res, url) {
+	const commentsMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9_-]{1,80})\/comments$/);
 	const match = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9_-]{1,80})$/);
 
 	if (url.pathname.startsWith("/api/auth/") && await handleAuth(req, res, url)) {
 		return true;
 	}
+
+	if (commentsMatch) return handleComments(req, res, commentsMatch[1], url);
 
 	if (url.pathname === "/api/health" && req.method === "GET") {
 		sendJson(res, 200, { status: "ok", storage: r2 ? "cloudflare-r2" : "local" });
