@@ -17,6 +17,12 @@ const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(ROOT, "uploads"));
 const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;
+const FRONTEND_ORIGINS = new Set(
+	(process.env.FRONTEND_ORIGINS || "")
+		.split(",")
+		.map(origin => origin.trim())
+		.filter(Boolean)
+);
 const R2_KEYS = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"];
 const configuredR2Keys = R2_KEYS.filter(key => process.env[key]);
 if (configuredR2Keys.length > 0 && configuredR2Keys.length !== R2_KEYS.length) {
@@ -57,6 +63,30 @@ const STATIC_TYPES = {
 function sendJson(res, status, data) {
 	res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
 	res.end(JSON.stringify(data));
+}
+
+function handleCors(req, res) {
+	const origin = req.headers.origin;
+	if (!origin) return true;
+
+	let sameOrigin = false;
+	try {
+		sameOrigin = new URL(origin).host === req.headers.host;
+	} catch {
+		sameOrigin = false;
+	}
+
+	if (!sameOrigin && !FRONTEND_ORIGINS.has(origin)) {
+		sendJson(res, 403, { error: "This website is not allowed to use the API." });
+		return false;
+	}
+
+	res.setHeader("Access-Control-Allow-Origin", origin);
+	res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+	res.setHeader("Access-Control-Max-Age", "600");
+	res.setHeader("Vary", "Origin");
+	return true;
 }
 
 function videoFilename(id, extension) {
@@ -332,6 +362,13 @@ async function serveStatic(req, res, url) {
 
 async function handleRequest(req, res) {
 	try {
+		if (!handleCors(req, res)) return;
+		if (req.method === "OPTIONS") {
+			res.writeHead(204);
+			res.end();
+			return;
+		}
+
 		const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 		if (url.pathname.startsWith("/api/")) {
 			const handled = await handleApi(req, res, url);
