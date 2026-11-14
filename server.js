@@ -25,6 +25,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(ROOT, "uploads"));
 const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;
+const MAX_VIDEO_TITLE_LENGTH = 120;
 const MAX_AUTH_BODY_SIZE = 8 * 1024;
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const AUTH_COOKIE_NAME = "pingute_session";
@@ -419,6 +420,18 @@ function publicComment(record) {
 }
 
 async function videoExists(videoId, req, res) {
+	if (!r2) {
+		for (const extension of Object.values(VIDEO_TYPES)) {
+			try {
+				await fs.promises.stat(path.join(UPLOAD_DIR, videoFilename(videoId, extension)));
+				return true;
+			} catch (error) {
+				if (error.code !== "ENOENT") throw error;
+			}
+		}
+		return false;
+	}
+
 	for (const extension of Object.values(VIDEO_TYPES)) {
 		try {
 			await sendR2(new HeadObjectCommand({
@@ -592,6 +605,70 @@ function videoKey(id, extension) {
 	return `videos/${videoFilename(id, extension)}`;
 }
 
+function videoMetadataPath(id) {
+	return path.join(UPLOAD_DIR, `${id}.metadata.json`);
+}
+
+function defaultVideoMetadata(id, fallbackTitle, updatedAt) {
+	return {
+		title: fallbackTitle || "Untitled post",
+		parentId: null,
+		chainId: id,
+		createdAt: updatedAt || null
+	};
+}
+
+function parseVideoMetadata(metadata, id, fallbackTitle, updatedAt) {
+	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+		throw new Error("Stored video metadata is invalid.");
+	}
+
+	if (metadata.title !== undefined && typeof metadata.title !== "string") {
+		throw new Error("Stored video metadata is invalid.");
+	}
+	const title = metadata.title
+		? Buffer.from(metadata.title, "base64url").toString("utf8")
+		: fallbackTitle || "Untitled post";
+	const parentId = metadata.parentid || metadata.parentId || null;
+	const chainId = metadata.chainid || metadata.chainId || id;
+	const createdAt = metadata.createdat || metadata.createdAt || updatedAt || null;
+	if (typeof title !== "string" || !title.trim()
+		|| (parentId !== null && (typeof parentId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(parentId)))
+		|| typeof chainId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(chainId)
+		|| (createdAt !== null && (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))))) {
+		throw new Error("Stored video metadata is invalid.");
+	}
+
+	return { title, parentId, chainId, createdAt };
+}
+
+async function readVideoMetadata(id, fallbackTitle, updatedAt, req, res) {
+	if (!r2) {
+		let metadata;
+		try {
+			metadata = JSON.parse(await fs.promises.readFile(videoMetadataPath(id), "utf8"));
+		} catch (error) {
+			if (error.code === "ENOENT") return defaultVideoMetadata(id, fallbackTitle, updatedAt);
+			if (error instanceof SyntaxError) throw new Error("Stored video metadata contains invalid JSON.");
+			throw error;
+		}
+		return parseVideoMetadata(metadata, id, fallbackTitle, updatedAt);
+	}
+
+	for (const extension of Object.values(VIDEO_TYPES)) {
+		try {
+			const head = await sendR2(new HeadObjectCommand({
+				Bucket: r2Bucket,
+				Key: videoKey(id, extension)
+			}), { req, res });
+			return parseVideoMetadata(head.Metadata || {}, id, fallbackTitle, updatedAt);
+		} catch (error) {
+			if (!isNotFound(error)) throw error;
+		}
+	}
+	return defaultVideoMetadata(id, fallbackTitle, updatedAt);
+}
+
 function isNotFound(error) {
 	return error.name === "NotFound" || error.name === "NoSuchKey" || error.$metadata?.httpStatusCode === 404;
 }
@@ -617,17 +694,21 @@ async function listVideos(req, res) {
 			if (error.code === "ENOENT") return [];
 			throw error;
 		});
-		return Promise.all(entries
+		const videos = entries
 			.filter(entry => entry.isFile() && /\.(mp4|webm|mov|mkv)$/i.test(entry.name))
 			.map(async entry => {
 				const stats = await fs.promises.stat(path.join(UPLOAD_DIR, entry.name));
+				const id = path.parse(entry.name).name;
+				const updatedAt = stats.mtime.toISOString();
 				return {
-					id: path.parse(entry.name).name,
+					id,
 					filename: entry.name,
 					size: stats.size,
-					updatedAt: stats.mtime.toISOString()
+					updatedAt,
+					...await readVideoMetadata(id, "Untitled post", updatedAt, req, res)
 				};
-			}));
+			});
+		return Promise.all(videos);
 	}
 
 	const videos = [];
@@ -650,18 +731,45 @@ async function listVideos(req, res) {
 		}
 		continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined;
 	} while (continuationToken);
-	return videos;
+	let nextVideoIndex = 0;
+	const enrichedVideos = new Array(videos.length);
+	await Promise.all(Array.from({ length: Math.min(8, videos.length) }, async () => {
+		while (nextVideoIndex < videos.length) {
+			const index = nextVideoIndex++;
+			const video = videos[index];
+			enrichedVideos[index] = {
+				...video,
+				...await readVideoMetadata(video.id, "Untitled post", video.updatedAt, req, res)
+			};
+		}
+	}));
+	return enrichedVideos;
 }
 
-async function saveVideo(req, res, id, extension) {
+async function saveVideo(req, res, id, extension, metadata) {
 	if (!r2) {
 		await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
 		const destination = path.join(UPLOAD_DIR, videoFilename(id, extension));
+		let videoWritten = false;
+		let metadataWriteStarted = false;
 		try {
 			await pipeline(req, uploadSizeLimit(), fs.createWriteStream(destination, { flags: "wx" }));
+			videoWritten = true;
+			metadataWriteStarted = true;
+			await fs.promises.writeFile(videoMetadataPath(id), JSON.stringify({
+				title: Buffer.from(metadata.title, "utf8").toString("base64url"),
+				parentid: metadata.parentId,
+				chainid: metadata.chainId,
+				createdat: metadata.createdAt
+			}), { flag: "wx" });
 		} catch (error) {
-			if (error.code !== "EEXIST") {
+			if (error.code !== "EEXIST" || videoWritten) {
 				await fs.promises.unlink(destination).catch(unlinkError => {
+					if (unlinkError.code !== "ENOENT") throw unlinkError;
+				});
+			}
+			if (metadataWriteStarted && error.code !== "EEXIST") {
+				await fs.promises.unlink(videoMetadataPath(id)).catch(unlinkError => {
 					if (unlinkError.code !== "ENOENT") throw unlinkError;
 				});
 			}
@@ -690,7 +798,13 @@ async function saveVideo(req, res, id, extension) {
 			Key: key,
 			Body: fs.createReadStream(temporaryFile),
 			ContentLength: stats.size,
-			ContentType: Object.keys(VIDEO_TYPES).find(type => VIDEO_TYPES[type] === extension)
+			ContentType: Object.keys(VIDEO_TYPES).find(type => VIDEO_TYPES[type] === extension),
+			Metadata: {
+				title: Buffer.from(metadata.title, "utf8").toString("base64url"),
+				chainid: metadata.chainId,
+				createdat: metadata.createdAt,
+				...(metadata.parentId ? { parentid: metadata.parentId } : {})
+			}
 		}), { timeoutMs: 120000, req, res });
 		return key;
 	} finally {
@@ -784,6 +898,7 @@ async function readVideo(req, res, id) {
 
 async function handleApi(req, res, url) {
 	const commentsMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9_-]{1,80})\/comments$/);
+	const chainMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9_-]{1,80})\/chain$/);
 	const match = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9_-]{1,80})$/);
 
 	if (url.pathname.startsWith("/api/auth/") && await handleAuth(req, res, url)) {
@@ -791,6 +906,26 @@ async function handleApi(req, res, url) {
 	}
 
 	if (commentsMatch) return handleComments(req, res, commentsMatch[1], url);
+
+	if (chainMatch) {
+		if (req.method !== "GET") {
+			res.setHeader("Allow", "GET");
+			sendJson(res, 405, { error: "Method not allowed." });
+			return true;
+		}
+		const videos = await listVideos(req, res);
+		const requestedVideo = videos.find(video => video.id === chainMatch[1]);
+		if (!requestedVideo) {
+			sendJson(res, 404, { error: "Video not found." });
+			return true;
+		}
+		const posts = videos
+			.filter(video => video.chainId === requestedVideo.chainId)
+			.sort((left, right) => Date.parse(left.createdAt || left.updatedAt || 0)
+				- Date.parse(right.createdAt || right.updatedAt || 0));
+		sendJson(res, 200, { chainId: requestedVideo.chainId, posts });
+		return true;
+	}
 
 	if (url.pathname === "/api/health" && req.method === "GET") {
 		sendJson(res, 200, { status: "ok", storage: r2 ? "cloudflare-r2" : "local" });
@@ -812,6 +947,18 @@ async function handleApi(req, res, url) {
 			return true;
 		}
 
+		const titleParameter = url.searchParams.get("title");
+		const title = titleParameter === null ? id : titleParameter.trim();
+		const parentId = url.searchParams.get("parentId") || null;
+		if (!title || title.length > MAX_VIDEO_TITLE_LENGTH) {
+			sendJson(res, 400, { error: `Title must be between 1 and ${MAX_VIDEO_TITLE_LENGTH} characters.` });
+			return true;
+		}
+		if (parentId && !/^[A-Za-z0-9_-]{1,80}$/.test(parentId)) {
+			sendJson(res, 400, { error: "The parent post id is invalid." });
+			return true;
+		}
+
 		const declaredSize = Number(req.headers["content-length"]);
 		if (Number.isFinite(declaredSize) && declaredSize > MAX_UPLOAD_SIZE) {
 			sendJson(res, 413, { error: "Video exceeds the 100 MB upload limit." });
@@ -819,8 +966,30 @@ async function handleApi(req, res, url) {
 		}
 
 		try {
-			const storedAs = await saveVideo(req, res, id, extension);
-			sendJson(res, 201, { id, filename: path.basename(storedAs), storage: r2 ? "r2" : "local" });
+			let chainId = id;
+			if (parentId) {
+				if (!await videoExists(parentId, req, res)) {
+					sendJson(res, 404, { error: "Parent post not found." });
+					return true;
+				}
+				const parentMetadata = await readVideoMetadata(parentId, "Untitled post", null, req, res);
+				chainId = parentMetadata.chainId;
+			}
+			const metadata = {
+				title,
+				parentId,
+				chainId,
+				createdAt: new Date().toISOString()
+			};
+			const storedAs = await saveVideo(req, res, id, extension, metadata);
+			sendJson(res, 201, {
+				id,
+				filename: path.basename(storedAs),
+				title,
+				parentId,
+				chainId,
+				storage: r2 ? "r2" : "local"
+			});
 		} catch (error) {
 			if (error.code === "EEXIST" || error.code === "VIDEO_EXISTS") {
 				sendJson(res, 409, { error: "A video with this id already exists." });
