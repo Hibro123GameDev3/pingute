@@ -65,6 +65,40 @@ function sendJson(res, status, data) {
 	res.end(JSON.stringify(data));
 }
 
+async function sendR2(command, { timeoutMs = 30000, req, res } = {}) {
+	const controller = new AbortController();
+	let timedOut = false;
+	const abortRequest = () => controller.abort();
+	const abortResponse = () => {
+		if (!res.writableFinished) controller.abort();
+	};
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		abortRequest();
+	}, timeoutMs);
+
+	if (req && res) {
+		req.once("aborted", abortRequest);
+		res.once("close", abortResponse);
+		if (req.aborted || (res.destroyed && !res.writableFinished)) abortRequest();
+	}
+
+	try {
+		return await r2.send(command, { abortSignal: controller.signal });
+	} catch (error) {
+		if (!timedOut) throw error;
+		const timeoutError = new Error("Cloudflare R2 request timed out.");
+		timeoutError.code = "R2_TIMEOUT";
+		throw timeoutError;
+	} finally {
+		clearTimeout(timeout);
+		if (req && res) {
+			req.removeListener("aborted", abortRequest);
+			res.removeListener("close", abortResponse);
+		}
+	}
+}
+
 function handleCors(req, res) {
 	const origin = req.headers.origin;
 	if (!origin) return true;
@@ -116,7 +150,7 @@ function uploadSizeLimit() {
 	});
 }
 
-async function listVideos() {
+async function listVideos(req, res) {
 	if (!r2) {
 		const entries = await fs.promises.readdir(UPLOAD_DIR, { withFileTypes: true }).catch(error => {
 			if (error.code === "ENOENT") return [];
@@ -138,11 +172,11 @@ async function listVideos() {
 	const videos = [];
 	let continuationToken;
 	do {
-		const result = await r2.send(new ListObjectsV2Command({
+		const result = await sendR2(new ListObjectsV2Command({
 			Bucket: r2Bucket,
 			Prefix: "videos/",
 			ContinuationToken: continuationToken
-		}));
+		}), { req, res });
 		for (const object of result.Contents || []) {
 			const filename = path.posix.basename(object.Key || "");
 			if (!/^[A-Za-z0-9_-]{1,80}\.(mp4|webm|mov|mkv)$/i.test(filename)) continue;
@@ -158,7 +192,7 @@ async function listVideos() {
 	return videos;
 }
 
-async function saveVideo(req, id, extension) {
+async function saveVideo(req, res, id, extension) {
 	if (!r2) {
 		await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
 		const destination = path.join(UPLOAD_DIR, videoFilename(id, extension));
@@ -177,7 +211,7 @@ async function saveVideo(req, id, extension) {
 
 	const key = videoKey(id, extension);
 	try {
-		await r2.send(new HeadObjectCommand({ Bucket: r2Bucket, Key: key }));
+		await sendR2(new HeadObjectCommand({ Bucket: r2Bucket, Key: key }), { timeoutMs: 15000, req, res });
 		const error = new Error("A video with this id already exists.");
 		error.code = "VIDEO_EXISTS";
 		throw error;
@@ -190,13 +224,13 @@ async function saveVideo(req, id, extension) {
 	try {
 		await pipeline(req, uploadSizeLimit(), fs.createWriteStream(temporaryFile, { flags: "wx" }));
 		const stats = await fs.promises.stat(temporaryFile);
-		await r2.send(new PutObjectCommand({
+		await sendR2(new PutObjectCommand({
 			Bucket: r2Bucket,
 			Key: key,
 			Body: fs.createReadStream(temporaryFile),
 			ContentLength: stats.size,
 			ContentType: Object.keys(VIDEO_TYPES).find(type => VIDEO_TYPES[type] === extension)
-		}));
+		}), { timeoutMs: 120000, req, res });
 		return key;
 	} finally {
 		await fs.promises.unlink(temporaryFile).catch(error => {
@@ -205,19 +239,57 @@ async function saveVideo(req, id, extension) {
 	}
 }
 
+function parseByteRange(header, size) {
+	if (!header) return null;
+	const match = header.match(/^bytes=(\d*)-(\d*)$/);
+	if (!match || (!match[1] && !match[2])) return { invalid: true };
+
+	let start;
+	let end;
+	if (!match[1]) {
+		const suffixLength = Number(match[2]);
+		if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { invalid: true };
+		start = Math.max(size - suffixLength, 0);
+		end = size - 1;
+	} else {
+		start = Number(match[1]);
+		end = match[2] ? Number(match[2]) : size - 1;
+		if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= size || start > end) {
+			return { invalid: true };
+		}
+		end = Math.min(end, size - 1);
+	}
+
+	return { start, end, length: end - start + 1 };
+}
+
 async function readVideo(req, res, id) {
 	for (const [contentType, extension] of Object.entries(VIDEO_TYPES)) {
 		if (!r2) {
 			const filePath = path.join(UPLOAD_DIR, videoFilename(id, extension));
 			try {
 				const stats = await fs.promises.stat(filePath);
-				res.writeHead(200, {
+				const range = req.method === "GET" ? parseByteRange(req.headers.range, stats.size) : null;
+				if (range?.invalid) {
+					res.writeHead(416, {
+						"Accept-Ranges": "bytes",
+						"Content-Range": `bytes */${stats.size}`
+					});
+					res.end();
+					return true;
+				}
+
+				res.writeHead(range ? 206 : 200, {
+					...(range ? {
+						"Content-Range": `bytes ${range.start}-${range.end}/${stats.size}`,
+						"Content-Length": range.length
+					} : { "Content-Length": stats.size }),
+					"Accept-Ranges": "bytes",
 					"Content-Type": contentType,
-					"Content-Length": stats.size,
 					"X-Content-Type-Options": "nosniff"
 				});
 				if (req.method === "HEAD") res.end();
-				else await pipeline(fs.createReadStream(filePath), res);
+				else await pipeline(fs.createReadStream(filePath, range ? { start: range.start, end: range.end } : undefined), res);
 				return true;
 			} catch (error) {
 				if (error.code !== "ENOENT") throw error;
@@ -227,10 +299,16 @@ async function readVideo(req, res, id) {
 
 		try {
 			const command = req.method === "HEAD" ? HeadObjectCommand : GetObjectCommand;
-			const object = await r2.send(new command({ Bucket: r2Bucket, Key: videoKey(id, extension) }));
-			res.writeHead(200, {
+			const object = await sendR2(new command({
+				Bucket: r2Bucket,
+				Key: videoKey(id, extension),
+				...(req.method === "GET" && req.headers.range ? { Range: req.headers.range } : {})
+			}), { req, res });
+			res.writeHead(object.ContentRange ? 206 : 200, {
 				"Content-Type": object.ContentType || contentType,
 				...(object.ContentLength === undefined ? {} : { "Content-Length": object.ContentLength }),
+				...(object.ContentRange ? { "Content-Range": object.ContentRange } : {}),
+				"Accept-Ranges": "bytes",
 				"X-Content-Type-Options": "nosniff"
 			});
 			if (req.method === "HEAD") res.end();
@@ -252,7 +330,7 @@ async function handleApi(req, res, url) {
 	}
 
 	if (url.pathname === "/api/videos" && req.method === "GET") {
-		sendJson(res, 200, await listVideos());
+		sendJson(res, 200, await listVideos(req, res));
 		return true;
 	}
 
@@ -273,7 +351,7 @@ async function handleApi(req, res, url) {
 		}
 
 		try {
-			const storedAs = await saveVideo(req, id, extension);
+			const storedAs = await saveVideo(req, res, id, extension);
 			sendJson(res, 201, { id, filename: path.basename(storedAs), storage: r2 ? "r2" : "local" });
 		} catch (error) {
 			if (error.code === "EEXIST" || error.code === "VIDEO_EXISTS") {
@@ -377,9 +455,19 @@ async function handleRequest(req, res) {
 			await serveStatic(req, res, url);
 		}
 	} catch (error) {
+		if (["ABORT_ERR", "ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"].includes(error.code)) {
+			if (!res.destroyed) res.destroy();
+			return;
+		}
+
 		console.error("Request failed:", error);
-		if (!res.headersSent) sendJson(res, 500, { error: "Internal server error." });
-		else res.destroy(error);
+		if (!res.headersSent && !res.destroyed) {
+			const timedOut = error.code === "R2_TIMEOUT";
+			sendJson(res, timedOut ? 504 : 500, {
+				error: timedOut ? error.message : "Internal server error."
+			});
+		}
+		else if (!res.destroyed) res.destroy();
 	}
 }
 
